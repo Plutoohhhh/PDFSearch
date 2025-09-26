@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage, QPixmap, Qt, QAction, QStandardItem, QIcon, QS
 from PySide6.QtWidgets import QFileDialog, QLabel, QMessageBox, QMenu, QInputDialog, \
     QFormLayout, QCheckBox, QDateEdit, QPushButton, QGroupBox, QListWidgetItem, QWidget, QTreeView, QAbstractItemView, \
     QApplication, QStyle, QFileIconProvider, QHBoxLayout, QComboBox, QLineEdit, QVBoxLayout
-from PySide6.QtCore import QDir, QDate, QFileInfo, QStandardPaths
+from PySide6.QtCore import QDir, QDate, QFileInfo, QStandardPaths, QTimer
 from PySide6.QtWidgets import QFileSystemModel
 
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker
@@ -192,6 +192,146 @@ class FileSearchThread(QThread):
             return self.cancel_requested
 
 
+# 添加后台备份线程类
+class BackupThread(QThread):
+    """后台备份线程，避免阻塞UI"""
+    progress = Signal(str)  # 传递备份进度信息
+    finished = Signal(str)  # 传递备份完成信息
+    error = Signal(str)  # 传递错误信息
+
+    def __init__(self, source_paths, parent=None):
+        super().__init__(parent)
+        self.source_paths = source_paths
+        self.cancel_requested = False
+        self.mutex = QMutex()
+
+    def run(self):
+        """线程主执行函数"""
+        try:
+            # 获取桌面路径 - 跨平台兼容
+            desktop_path = self.get_desktop_path()
+            if not desktop_path or not os.path.exists(desktop_path):
+                self.error.emit("无法获取桌面路径或桌面不存在")
+                return
+
+            # 创建备份文件夹（使用当前日期）
+            today = datetime.now().strftime("%Y-%m-%d")
+            backup_dir = os.path.join(desktop_path, f"Backup_{today}")
+
+            if not os.path.exists(backup_dir):
+                os.makedirs(backup_dir)
+                self.progress.emit(f"创建备份文件夹: {os.path.basename(backup_dir)}")
+
+            # 备份每个选中的文件夹
+            total_files = 0
+            copied_files = 0
+            skipped_files = 0
+
+            for source_path in self.source_paths:
+                if self.is_canceled():
+                    return
+
+                # 计算源文件夹中的文件总数（用于进度显示）
+                for root, dirs, files in os.walk(source_path):
+                    total_files += len(files)
+
+            # 实际备份过程
+            for source_path in self.source_paths:
+                if self.is_canceled():
+                    return
+
+                # 在备份目录中创建对应的子文件夹
+                folder_name = os.path.basename(source_path.rstrip(os.sep))
+                target_folder = os.path.join(backup_dir, folder_name)
+
+                if not os.path.exists(target_folder):
+                    os.makedirs(target_folder)
+                    self.progress.emit(f"创建目标文件夹: {folder_name}")
+
+                # 递归复制文件
+                for root, dirs, files in os.walk(source_path):
+                    if self.is_canceled():
+                        return
+
+                    # 计算相对路径
+                    rel_path = os.path.relpath(root, source_path)
+                    target_path = os.path.join(target_folder, rel_path)
+
+                    # 创建目标子目录
+                    if not os.path.exists(target_path):
+                        os.makedirs(target_path)
+
+                    # 复制文件
+                    for file in files:
+                        if self.is_canceled():
+                            return
+
+                        src_file = os.path.join(root, file)
+                        dst_file = os.path.join(target_path, file)
+
+                        # 检查文件是否需要复制（不存在或不同）
+                        if not os.path.exists(dst_file) or \
+                                self.is_file_different(src_file, dst_file):
+                            try:
+                                shutil.copy2(src_file, dst_file)
+                                copied_files += 1
+                                if copied_files % 10 == 0:  # 每10个文件更新一次进度
+                                    self.progress.emit(f"已备份 {copied_files} 个文件...")
+                            except Exception as e:
+                                self.error.emit(f"复制文件失败: {os.path.basename(src_file)} -> {e}")
+                        else:
+                            skipped_files += 1
+
+            self.finished.emit(f"备份完成! 已备份 {copied_files} 个文件, 跳过 {skipped_files} 个未更改文件")
+
+        except Exception as e:
+            self.error.emit(f"备份过程中发生错误: {str(e)}")
+
+    def get_desktop_path(self):
+        """跨平台获取桌面路径"""
+        system = platform.system()
+        try:
+            if system == "Windows":
+                # Windows系统
+                return os.path.join(os.path.expanduser("~"), "Desktop")
+            elif system == "Darwin":
+                # macOS系统
+                return os.path.join(os.path.expanduser("~"), "Desktop")
+            else:
+                # Linux或其他系统
+                desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+                if desktop:
+                    return desktop
+                # 备用方案
+                return os.path.join(os.path.expanduser("~"), "Desktop")
+        except Exception:
+            # 最终备用方案
+            return os.path.expanduser("~")
+
+    def is_file_different(self, src, dst):
+        """检查两个文件是否不同（通过大小和修改时间）"""
+        
+        try:
+            src_stat = os.stat(src)
+            dst_stat = os.stat(dst)
+
+            # 比较文件大小和修改时间
+            return (src_stat.st_size != dst_stat.st_size or
+                    src_stat.st_mtime > dst_stat.st_mtime)
+        except:
+            # 如果无法获取文件信息，默认需要复制
+            return True
+
+    def cancel(self):
+        """请求取消备份"""
+        with QMutexLocker(self.mutex):
+            self.cancel_requested = True
+
+    def is_canceled(self):
+        """检查是否已请求取消"""
+        with QMutexLocker(self.mutex):
+            return self.cancel_requested
+
 
 class SearchWidget(QWidget, Ui_SearchWidget):
 
@@ -207,6 +347,7 @@ class SearchWidget(QWidget, Ui_SearchWidget):
 
         # 添加以下变量
         self.search_thread = None
+        self.backup_thread = None  # 添加备份线程变量
         self.search_results = []
         self.last_search_time = 0  # 防抖计时
         self.overwrite_all = False  # 保存时的覆盖选项
@@ -224,10 +365,101 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         self.grouped_unique_third_col = []
 
         self.setupUi(self)
+        # 先创建基本UI元素，确保必要的控件存在
+        self.create_basic_ui()
+
+        # 绑定基本事件
+        self.bind_basic()
+
+        # 延迟初始化复杂的UI组件
+        QTimer.singleShot(100, self.delayed_init)
+
+    def create_basic_ui(self):
+        """创建基本的UI元素，确保必要的控件存在"""
+        # 创建必要的控件，确保它们在bind_basic中可用
+        self.btn_selectExcel = QPushButton("选择Excel文件")
+        self.lineEdit_excel_path = QLineEdit()
+        self.lineEdit_excel_path.setReadOnly(True)
+        self.btn_open_excel_location = QPushButton()
+        self.btn_open_excel_location.setIcon(QApplication.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.btn_open_excel_location.setToolTip("在资源管理器中打开文件位置")
+        self.btn_open_excel_location.setFixedSize(30, 30)
+        self.btn_open_excel_location.setEnabled(False)
+
+        # 添加自动备份复选框
+        self.auto_backup_checkbox = QCheckBox("自动备份选中的文件夹")
+
+    def bind_basic(self):
+        """只绑定基本的事件，确保必要的功能可用"""
+        self.btn_selectFolder.clicked.connect(self.select_folder)
+        self.btn_selectExcel.clicked.connect(self.on_btn_selectExcel)
+        self.btn_open_excel_location.clicked.connect(self.open_excel_location)
+
+        # 绑定列表项变化事件以更新按钮状态
+        self.listWidget.itemChanged.connect(self.on_list_selection_changed)
+        self.listWidget.customContextMenuRequested.connect(self.show_list_context_menu)
+        self.listWidget.itemClicked.connect(self.show_file_preview)
+
+    def delayed_init(self):
+        """延迟初始化非关键UI组件"""
         self.resetUi()
-        self.bind()
 
+        # 绑定剩余的事件
+        self.bind_remaining()
 
+        # 初始化完成后触发一次搜索（如果有条件）
+        if hasattr(self, 'current_paths') and self.current_paths:
+            self.search_files()
+
+    def bind_remaining(self):
+        """绑定剩余的事件"""
+        # 这里绑定所有其他事件
+        self.category_combo.currentIndexChanged.connect(self.update_model_apn)
+        self.treeView_folder.clicked.connect(self.treeView_folder_clicked)
+        self.lineEdit_search_input.textChanged.connect(self.search_files)
+        self.enable_time_filter_checkbox.toggled.connect(self.search_files)
+        self.start_date.dateChanged.connect(self.search_files)
+        self.end_date.dateChanged.connect(self.search_files)
+        self.btn_select_all_list.clicked.connect(self.select_all_in_list)
+        self.btn_deselect_all_list.clicked.connect(self.deselect_all_in_list)
+        self.btn_refresh_folder.clicked.connect(self.refresh_selected_folders)
+        self.custom_filter_input.textChanged.connect(self.search_files)
+
+        self.lineEdit_search_input.textChanged.connect(self.trigger_search)
+        self.enable_time_filter_checkbox.toggled.connect(self.trigger_search)
+        self.start_date.dateChanged.connect(self.trigger_search)
+        self.end_date.dateChanged.connect(self.trigger_search)
+        self.custom_filter_input.textChanged.connect(self.trigger_search)
+
+        # treeView绑定右键点击事件
+        self.treeView_folder.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.treeView_folder.customContextMenuRequested.connect(self.show_context_menu)
+
+        self.btn_Preview.clicked.connect(self.show_pdf_window)
+
+        # 添加双击事件绑定
+        self.treeView_folder.doubleClicked.connect(self.open_selected_file)
+        self.listWidget.itemDoubleClicked.connect(self.open_selected_file)
+        self.listWidget.setContextMenuPolicy(Qt.CustomContextMenu)
+
+        # 绑定另存为按钮
+        self.btn_save_as.clicked.connect(self.save_selected_files)
+
+        # 修复：直接连接到 trigger_search
+        self.enable_category_checkbox.stateChanged.connect(self.trigger_search)
+        self.enable_model_checkbox.stateChanged.connect(self.trigger_search)
+        self.enable_apn_checkbox.stateChanged.connect(self.trigger_search)
+        self.enable_custom_filter_checkbox.stateChanged.connect(self.trigger_search)
+
+        # 下拉框和输入框变更时触发搜索
+        self.category_combo.currentIndexChanged.connect(self.trigger_search)
+        self.model_combo.currentIndexChanged.connect(self.trigger_search)
+        self.apn_combo.currentIndexChanged.connect(self.trigger_search)
+        self.custom_filter_input.textChanged.connect(self.trigger_search)
+
+        # 绑定全选和取消全选按钮
+        self.btn_select_all_list.clicked.connect(self.select_all_in_list)
+        self.btn_deselect_all_list.clicked.connect(self.deselect_all_in_list)
 
     def resetUi(self):
         self.treeView_folder.setEnabled(False)
@@ -259,11 +491,6 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         # 将搜索布局添加到主布局
         main_layout.insertLayout(0, search_layout)
 
-
-        # # 1. 将搜索输入框移动到顶部
-        # main_layout.removeWidget(self.lineEdit_search_input)
-        # main_layout.insertWidget(0, self.lineEdit_search_input)
-
         # 2. 添加文件夹选择行
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(self.btn_selectFolder)
@@ -280,24 +507,17 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         # 只添加一次布局
         main_layout.insertLayout(1, folder_layout)
 
-        # 3. 添加Excel文件选择行
+        # 添加自动备份复选框
+        self.auto_backup_checkbox = QCheckBox("自动备份选中的文件夹")
+        self.auto_backup_checkbox.setChecked(True)  # 默认启用自动备份
+        main_layout.insertWidget(2, self.auto_backup_checkbox)
+
+        # 3. 添加Excel文件选择行 - 这里使用在create_basic_ui中创建的控件
         excel_layout = QHBoxLayout()
-        self.btn_selectExcel = QPushButton("选择Excel文件")
-        self.lineEdit_excel_path = QLineEdit()
-        self.lineEdit_excel_path.setReadOnly(True)
-
-        # 添加"打开位置"按钮
-        self.btn_open_excel_location = QPushButton()
-        self.btn_open_excel_location.setIcon(QApplication.style().standardIcon(QStyle.SP_DirOpenIcon))
-        self.btn_open_excel_location.setToolTip("在资源管理器中打开文件位置")
-        self.btn_open_excel_location.setFixedSize(30, 30)  # 固定按钮大小
-        self.btn_open_excel_location.setEnabled(False)  # 初始不可用
-
-        # 修复：只添加一次布局
-        excel_layout.addWidget(self.btn_selectExcel)
-        excel_layout.addWidget(self.lineEdit_excel_path)
-        excel_layout.addWidget(self.btn_open_excel_location)  # 添加打开位置按钮
-        main_layout.insertLayout(2, excel_layout)
+        excel_layout.addWidget(self.btn_selectExcel)  # 使用已创建的按钮
+        excel_layout.addWidget(self.lineEdit_excel_path)  # 使用已创建的输入框
+        excel_layout.addWidget(self.btn_open_excel_location)  # 使用已创建的按钮
+        main_layout.insertLayout(3, excel_layout)
 
         # 4. 添加属性筛选区域
         self.property_filter_group = QGroupBox("属性筛选")
@@ -376,7 +596,7 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         property_layout.addLayout(custom_layout)
 
         self.property_filter_group.setLayout(property_layout)
-        main_layout.insertWidget(3, self.property_filter_group)
+        main_layout.insertWidget(4, self.property_filter_group)
 
         # 5. 添加时间筛选区域
         self.start_date = QDateEdit()
@@ -399,15 +619,15 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         time_layout.addRow("结束日期:", self.end_date)
         time_layout.addRow(self.clear_time_button)
         time_group.setLayout(time_layout)
-        main_layout.insertWidget(4, time_group)
+        main_layout.insertWidget(5, time_group)
 
         # 6. 将搜索结果标签和列表移到下方
         # 确保搜索结果标签在列表上方
         main_layout.removeWidget(self.label_2)
-        main_layout.insertWidget(5, self.label_2)
+        main_layout.insertWidget(6, self.label_2)
 
         main_layout.removeWidget(self.listWidget)
-        main_layout.insertWidget(6, self.listWidget)
+        main_layout.insertWidget(7, self.listWidget)
 
         # 7. 确保预览区域相关控件在底部
         # 获取 horizontalLayout_3 中的所有控件
@@ -439,14 +659,14 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         preview_layout.addItem(spacer)
 
         # 添加到主布局
-        main_layout.insertLayout(7, preview_layout)
+        main_layout.insertLayout(8, preview_layout)
 
         # 设置列表支持复选框
         self.listWidget.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
         # 8. 添加预览区域
         main_layout.removeWidget(self.scrollArea)
-        main_layout.insertWidget(8, self.scrollArea)
+        main_layout.insertWidget(9, self.scrollArea)
 
         # 9. 状态标签保持在底部
         main_layout.removeWidget(self.label_status)
@@ -976,6 +1196,38 @@ class SearchWidget(QWidget, Ui_SearchWidget):
             self.update_save_button_state()
             self.update_selected_count()
 
+            # 初始更新一次按钮状态
+            self.update_save_button_state()
+            self.update_selected_count()
+
+            # 如果启用了自动备份，则启动备份
+            if self.auto_backup_checkbox.isChecked():
+                self.start_auto_backup(folders)
+
+    def start_auto_backup(self, folders):
+        """自动启动备份线程"""
+        # 如果已有备份在进行，取消它
+        if self.backup_thread and self.backup_thread.isRunning():
+            self.backup_thread.cancel()
+            self.backup_thread.wait(1000)  # 等待最多1秒
+
+        # 创建并启动备份线程
+        self.backup_thread = BackupThread(folders, self)
+        self.backup_thread.progress.connect(self.label_status.setText)
+        self.backup_thread.finished.connect(self.on_backup_finished)
+        self.backup_thread.error.connect(self.on_backup_error)
+        self.backup_thread.start()
+
+    def on_backup_finished(self, message):
+        """备份完成处理"""
+        self.label_status.setText(message)
+        # 可以在这里添加通知或日志记录
+
+    def on_backup_error(self, error_message):
+        """备份错误处理"""
+        self.label_status.setText(error_message)
+        QMessageBox.warning(self, "备份错误", error_message)
+
     def populate_folder_tree(self, parent_item, folder_path):
         """递归填充文件夹内容到树状视图"""
         try:
@@ -1384,7 +1636,6 @@ class SearchWidget(QWidget, Ui_SearchWidget):
                     selected_files.add(path)
 
         return list(selected_files)
-    # 添加另存为功能
 
     def collect_checked_files_from_folder(self, parent_item, selected_files):
         """递归收集文件夹中被勾选的文件"""
@@ -1792,14 +2043,106 @@ class SearchWidget(QWidget, Ui_SearchWidget):
         """处理Excel文件选择"""
         # 获取桌面路径
         desktop_path = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
-        # 用户选择Excel文件
-        excel_path, _ = QFileDialog.getOpenFileName(self, "选择Excel文件", desktop_path,
-                                                    "Excel files (*.xlsx *.xls *.csv)")
-        if excel_path:
-            self.lineEdit_excel_path.setText(excel_path)
-            self.excel_path = excel_path  # 存储路径
+        # 用户选择多个Excel文件
+        excel_paths, _ = QFileDialog.getOpenFileNames(self, "选择Excel文件 (可多选)", desktop_path,
+                                                      "Excel files (*.xlsx *.xls *.csv)")
+        if excel_paths:
+            # 存储所有Excel文件路径
+            self.excel_paths = excel_paths
+            # 显示选择的文件数量
+            self.lineEdit_excel_path.setText(f"已选择 {len(excel_paths)} 个Excel文件")
             self.btn_open_excel_location.setEnabled(True)  # 启用打开位置按钮
-            self.excel_read(excel_path)
+            # 读取所有Excel文件
+            self.excel_read_multiple(excel_paths)
+
+    def excel_read_multiple(self, excel_paths):
+        """读取多个Excel文件并合并属性，提供详细的处理结果反馈"""
+        all_dfs = []
+        success_files = []  # 成功读取的文件
+        failed_files = []  # 读取失败的文件及其原因
+
+        for excel_path in excel_paths:
+            try:
+                # 尝试读取Excel文件
+                df = pd.read_excel(excel_path)
+
+                # 检查是否包含必要的列
+                desired_columns = ['Material Category', 'Material Model', 'APN']
+                missing_columns = [col for col in desired_columns if col not in df.columns]
+
+                if missing_columns:
+                    failed_files.append((os.path.basename(excel_path),
+                                         f"缺少必要列: {', '.join(missing_columns)}"))
+                    continue
+
+                all_dfs.append(df)
+                success_files.append(os.path.basename(excel_path))
+
+            except Exception as e:
+                failed_files.append((os.path.basename(excel_path), f"读取错误: {str(e)}"))
+                continue
+
+        # 如果没有成功读取任何文件，则显示错误
+        if not all_dfs:
+            error_msg = "未能成功读取任何Excel文件:\n"
+            for filename, reason in failed_files:
+                error_msg += f"- {filename}: {reason}\n"
+            QMessageBox.critical(self, "错误", error_msg)
+            return
+
+        # 合并所有DataFrame
+        try:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"合并Excel数据失败: {e}")
+            return
+
+        # 指定需要保留的列名
+        desired_columns = ['Material Category', 'Material Model', 'APN']
+        existing_columns = [col for col in desired_columns if col in combined_df.columns]
+
+        # 前向填充NaN
+        combined_df = combined_df[existing_columns].ffill()
+
+        # 存储数据用于搜索
+        self.excel_data = combined_df
+
+        # 将数据分组存储（用于下拉框）
+        self.grouped_unique_first_col = combined_df[existing_columns[0]].unique().tolist()
+        self.grouped_unique_second_col = []
+        self.grouped_unique_third_col = []
+
+        # 按第一列分组，获取第二列和第三列的唯一值
+        grouped = combined_df.groupby(existing_columns[0])
+        for name, group in grouped:
+            # 第二列的唯一值
+            unique_second = group[existing_columns[1]].unique().tolist()
+            self.grouped_unique_second_col.append(unique_second)
+            # 第三列的唯一值
+            unique_third = group[existing_columns[2]].unique().tolist()
+            self.grouped_unique_third_col.append(unique_third)
+
+        # 更新下拉框
+        self.category_combo.clear()
+        self.category_combo.addItems(self.grouped_unique_first_col)
+
+        # 更新后两个下拉框（根据当前选中的第一列）
+        self.update_model_apn()
+
+        # 显示处理结果摘要
+        result_msg = f"成功读取 {len(success_files)} 个文件:\n"
+        result_msg += "\n".join([f"- {f}" for f in success_files]) + "\n\n"
+
+        if failed_files:
+            result_msg += f"有 {len(failed_files)} 个文件读取失败:\n"
+            for filename, reason in failed_files:
+                result_msg += f"- {filename}: {reason}\n"
+
+        # 显示信息对话框，但不会阻塞后续操作
+        QMessageBox.information(self, "Excel文件处理结果", result_msg)
+
+        # 在更新下拉框后触发搜索
+        self.search_files()
 
     def excel_read(self, excel_path):
         """读取Excel文件并更新下拉框选项"""
@@ -1811,7 +2154,7 @@ class SearchWidget(QWidget, Ui_SearchWidget):
             return
 
         # 指定需要保留的列名
-        desired_columns = ['Material Categroy', 'Material Model', 'APN']
+        desired_columns = ['Material Category', 'Material Model', 'APN']
         # 筛选出存在的列
         existing_columns = [col for col in desired_columns if col in df.columns]
 
@@ -1853,12 +2196,12 @@ class SearchWidget(QWidget, Ui_SearchWidget):
     # 添加打开Excel位置的方法
     def open_excel_location(self):
         """打开Excel文件所在位置"""
-        if not self.excel_path or not os.path.exists(self.excel_path):
+        if not hasattr(self, 'excel_paths') or not self.excel_paths or not os.path.exists(self.excel_paths[0]):
             QMessageBox.warning(self, "文件不存在", "Excel文件路径无效或文件已被移动")
             return
 
         # 调用已有的方法在资源管理器中显示文件位置
-        self.show_in_finder(self.excel_path)
+        self.show_in_finder(self.excel_paths[0])
 
     def update_model_apn(self):
         """更新模型和APN下拉框选项"""

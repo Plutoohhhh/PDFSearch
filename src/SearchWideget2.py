@@ -1669,7 +1669,7 @@ class SearchWidget(QWidget, Ui_SearchWidget):
             return
 
         # 指定需要保留的列名
-        desired_columns = ['Material Categroy', 'Material Model', 'APN']
+        desired_columns = ['Material Category', 'Material Model', 'APN']
         # 筛选出存在的列
         existing_columns = [col for col in desired_columns if col in df.columns]
 
